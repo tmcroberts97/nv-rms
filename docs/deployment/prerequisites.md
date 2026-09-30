@@ -70,12 +70,12 @@ algorithm, and SANs are all values, so they can vary per site. See
 full override surface. The rest of this section covers issuing them outside the
 chart.
 
-Chart-managed certificates are issued and renewed automatically, but only the
-switch client material is picked up automatically. The API server reads its
-certificate once at startup and needs a pod restart; switches keep the
-certificate last installed on them and need `ConfigureSwitchCertificate` re-run.
-Plan a redistribution cadence at least as short as `certificates.duration`
-before enabling this - see
+Chart-managed certificates are issued and renewed automatically. The API server
+and switch client material are picked up automatically: RMS re-reads the
+mounted files every 30 seconds and serves a renewed certificate without a pod
+restart. Switches keep the certificate last installed on them and need
+`ConfigureSwitchCertificate` re-run. Plan a redistribution cadence at least as
+short as `certificates.duration` before enabling this - see
 [Rotation and renewal](../../helm/README.md#rotation-and-renewal).
 
 ### cert-manager example

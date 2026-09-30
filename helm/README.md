@@ -445,23 +445,24 @@ resources need to be ordered ahead of the Deployment.
 
 Enabling `certificates` automates **issuance and renewal only**. cert-manager
 rewrites each Secret at `renewBefore`, and the kubelet refreshes the mounted
-files, but only one of the three consumers picks the new material up on its own:
+files. Two of the three consumers pick the new material up on their own:
 
 | Material | On renewal | To take effect |
 | --- | --- | --- |
-| API server certificate | Files update; the process keeps using the certificate it read at startup | Restart the pod |
+| API server certificate | Re-read from the mounted files every 30 seconds and served on new connections, no restart | Nothing |
 | Switch client mTLS | Picked up automatically, no restart | Nothing |
 | Switch server material | Files update; the copy on each switch is untouched | Re-run `ConfigureSwitchCertificate` |
 
-Two consequences follow, and both are load-bearing when choosing `duration`:
+Two details matter when choosing `duration`:
 
-- **The API server does not reload its own certificate.** RMS reads the cert,
-  key, and client CA once at startup and holds the parsed material for the life
-  of the process. When the mounted certificate expires, the pod keeps serving
-  the expired one — the Deployment has no probe and no rotation-triggered
-  rollout — until something restarts it. Use `kubectl rollout restart
-  deployment/rms-api-server -n <namespace>`, a controller such as
-  [Reloader](https://github.com/stakater/Reloader), or a scheduled restart.
+- **The API server reloads its own certificate.** RMS validates the cert, key,
+  and client CA at startup, then re-reads the files every 30 seconds and swaps
+  the material in when any of them change; existing connections keep the
+  certificate they negotiated. A renewal that fails to parse is logged and the
+  previous material stays in service. The
+  `rms_api_tls_certificate_not_after_seconds` gauge reports the expiry of the
+  certificate currently being served, so alert on it rather than on the
+  Secret's expiry — the two differ exactly when a reload has failed.
 - **Switches keep the certificate that was pushed to them.** Renewing the
   Secret changes the material inside the RMS pod, not the copy in the switch's
   NVOS store. Only `ConfigureSwitchCertificate` installs it, and each run mints
@@ -470,20 +471,21 @@ Two consequences follow, and both are load-bearing when choosing `duration`:
   expiry it was issued with, and RMS rejects an expired switch certificate on
   its outbound connections.
 
-So `certificates.duration` sets a hard deadline for a redistribution step that
-nothing in this chart performs. The 30-day default (`720h0m0s`, renewing at
-`360h0m0s`) suits sites that restart the API server and re-push to switches at
-least monthly; sites that do not should raise it — `8760h0m0s` for a yearly
-cadence — rather than rely on renewal alone. Both are settable per group, so the
-API server and the switch-side certificates can run on different clocks.
+So `certificates.duration` for the switch server material sets a hard deadline
+for a redistribution step that nothing in this chart performs. The 30-day
+default (`720h0m0s`, renewing at `360h0m0s`) suits sites that re-push to
+switches at least monthly; sites that do not should raise it — `8760h0m0s` for
+a yearly cadence — rather than rely on renewal alone. Both are settable per
+group, so the API server and the switch-side certificates can run on different
+clocks.
 
 `certificates.privateKey.rotationPolicy` defaults to `Always`, so each renewal
 mints a new private key. The chart sets this explicitly because cert-manager
 changed its own default from `Never` to `Always` in v1.18; without it the same
 values would rotate keys on one cluster and reuse them on another. Note that key
-rotation reaches a consumer only where certificate rotation does — for the API
-server and the switches, a reused key and a rotated one are equally stale until
-the restart or re-push happens.
+rotation reaches a consumer only where certificate rotation does — the API
+server picks both up on its next reload, while on the switches a reused key and
+a rotated one are equally stale until the re-push happens.
 
 ### Firmware PVC
 

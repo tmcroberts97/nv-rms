@@ -297,14 +297,19 @@ async fn start_service(
     );
     job_tracker.spawn_reaper();
 
+    if let Some(tls) = &tls {
+        tls.reloader()
+            .register_metrics(metrics_registry.as_ref())
+            .map_err(|e| format!("failed to register TLS metrics: {e}"))?;
+    }
+
     let metrics_tls = if config.metrics.tls {
         Some(
             tls.as_ref()
                 .ok_or_else(|| {
                     "metrics.tls requires gRPC TLS material (tls.cert and tls.key)".to_string()
                 })?
-                .metrics_rustls_config()
-                .map_err(|e| format!("failed to build metrics TLS config: {e}"))?,
+                .metrics_acceptor_source(),
         )
     } else {
         None

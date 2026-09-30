@@ -35,6 +35,7 @@ use tonic::transport::{Certificate as TonicCertificate, ClientTlsConfig, Endpoin
 use librms::protos::rack_manager::rack_manager_client::RackManagerClient;
 use librms::protos::rack_manager::{self as rm};
 use rackmanagementservice::api::grpc::server::{GrpcServer, TlsConfig, TlsMode};
+use rackmanagementservice::api::grpc::tls_reload::ReloadOutcome;
 use rackmanagementservice::metrics;
 use rackmanagementservice::orchestrator::job_tracker::JobTracker;
 use rackmanagementservice::orchestrator::rack_manager::RackManager;
@@ -274,6 +275,66 @@ async fn mtls_rejects_client_cert_signed_by_unknown_ca() {
     let ep = endpoint(port).tls_config(tls).expect("client tls config");
 
     expect_rpc_rejected(ep, "a client cert signed by an untrusted CA").await;
+
+    server.stop_without_awaiting_terminal();
+}
+
+/// Re-issues the server certificate and a client identity under a new CA and
+/// writes them over the fixture's files, as a cert-manager renewal would.
+/// Returns the new `(ca_pem, client_cert_pem, client_key_pem)`.
+fn rotate_trust_domain(fx: &MtlsFixture) -> (String, String, String) {
+    let ca = TestCa::new("rms-rotated-ca");
+    let (server_cert, server_key) = ca.issue(
+        vec!["localhost".into(), "127.0.0.1".into()],
+        "rms-rotated-server",
+        ExtendedKeyUsagePurpose::ServerAuth,
+    );
+    let (client_cert, client_key) = ca.issue(
+        vec!["rms-rotated-client".into()],
+        "rms-rotated-client",
+        ExtendedKeyUsagePurpose::ClientAuth,
+    );
+    std::fs::write(&fx.server_cert_path, server_cert.pem()).unwrap();
+    std::fs::write(&fx.server_key_path, server_key.serialize_pem()).unwrap();
+    std::fs::write(&fx.ca_path, ca.ca_pem()).unwrap();
+    (ca.ca_pem(), client_cert.pem(), client_key.serialize_pem())
+}
+
+/// Renewed material on disk is served after a reload, without restarting the
+/// server: the new trust domain works and the previous one is rejected.
+#[tokio::test]
+async fn rotated_server_material_is_served_after_reload() {
+    let fx = build_fixture();
+    let (mut server, port) = start_mtls_server(&fx).await;
+
+    let (ca_pem, client_cert_pem, client_key_pem) = rotate_trust_domain(&fx);
+    let reloader = server
+        .tls_reloader()
+        .expect("an mTLS server exposes its reloadable material");
+    assert!(matches!(
+        reloader.reload_if_changed().unwrap(),
+        ReloadOutcome::Reloaded { .. }
+    ));
+
+    let tls = client_tls_with_identity(&ca_pem, &client_cert_pem, &client_key_pem);
+    let channel = endpoint(port)
+        .tls_config(tls)
+        .expect("client tls config")
+        .connect()
+        .await
+        .expect("a client trusting the rotated CA should connect");
+    let mut client = RackManagerClient::new(channel);
+    client
+        .list_racks(tonic::Request::new(rm::ListRacksRequest {}))
+        .await
+        .expect("list_racks RPC should succeed against the rotated certificate");
+
+    let stale = client_tls_with_identity(&fx.ca_pem, &fx.client_cert_pem, &fx.client_key_pem);
+    expect_rpc_rejected(
+        endpoint(port).tls_config(stale).expect("client tls config"),
+        "a client still trusting the previous CA",
+    )
+    .await;
 
     server.stop_without_awaiting_terminal();
 }

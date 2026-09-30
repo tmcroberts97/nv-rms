@@ -21,8 +21,8 @@ use std::sync::Arc;
 use axum::Router;
 use prometheus::Registry;
 use tokio::sync::watch;
-use tokio_rustls::TlsAcceptor;
 
+use crate::api::grpc::tls_reload::TlsAcceptorSource;
 use crate::utilities::error::{Result, RmsError};
 
 use super::prometheus_route;
@@ -47,10 +47,12 @@ impl MetricsServer {
     /// Bind the metrics listener and begin serving in a background task.
     ///
     /// `tls` is `Some` for standard server-authenticated TLS (no client certs).
+    /// It is consulted per connection so renewed material is served without a
+    /// restart.
     pub async fn start(
         &mut self,
         registry: Arc<Registry>,
-        tls: Option<Arc<rustls::ServerConfig>>,
+        tls: Option<TlsAcceptorSource>,
     ) -> Result<()> {
         let addr: SocketAddr = format!("0.0.0.0:{}", self.port)
             .parse()
@@ -69,10 +71,9 @@ impl MetricsServer {
         self.shutdown_tx = Some(shutdown_tx);
 
         let task = match tls {
-            Some(tls_config) => {
+            Some(tls) => {
                 tracing::info!(port = self.port, mode = "TLS", "metrics server starting");
-                let tls_acceptor = TlsAcceptor::from(tls_config);
-                tokio::spawn(serve_tls(listener, router, tls_acceptor, shutdown_rx))
+                tokio::spawn(serve_tls(listener, router, tls, shutdown_rx))
             }
             None => {
                 tracing::info!(
@@ -136,7 +137,7 @@ async fn serve_plaintext(
 async fn serve_tls(
     listener: tokio::net::TcpListener,
     router: Router,
-    tls_acceptor: TlsAcceptor,
+    tls: TlsAcceptorSource,
     mut shutdown_rx: watch::Receiver<()>,
 ) {
     use hyper_util::rt::{TokioExecutor, TokioIo};
@@ -149,7 +150,7 @@ async fn serve_tls(
                 let Ok((stream, _)) = accept_result else {
                     continue;
                 };
-                let tls = tls_acceptor.clone();
+                let tls = tls();
                 let app = router.clone();
                 tokio::task::spawn(async move {
                     let tls_stream = match tls.accept(stream).await {
@@ -183,6 +184,7 @@ mod tests {
     use std::time::Duration;
 
     use axum::http::StatusCode;
+    use tokio_rustls::TlsAcceptor;
 
     use super::*;
     use crate::api::grpc::server::TlsMode;
@@ -269,8 +271,12 @@ mod tests {
     async fn metrics_server_serves_over_tls_and_shuts_down() {
         let port = portpicker::pick_unused_port().expect("no free port");
         let mut server = MetricsServer::new(port);
+        let config = test_server_config();
         server
-            .start(ensure_registry(), Some(test_server_config()))
+            .start(
+                ensure_registry(),
+                Some(Arc::new(move || TlsAcceptor::from(Arc::clone(&config)))),
+            )
             .await
             .expect("start metrics server");
 

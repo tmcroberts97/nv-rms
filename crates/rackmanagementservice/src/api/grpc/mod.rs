@@ -29,6 +29,7 @@ pub mod switch_certificate_handlers;
 pub mod switch_handlers;
 pub mod switch_image_handlers;
 pub mod switch_security_handlers;
+pub mod tls_reload;
 
 pub(crate) mod artifact_download;
 pub(crate) mod firmware_artifact_paths;

@@ -33,8 +33,8 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::watch;
 use tokio_util::sync::CancellationToken;
 use tonic::service::{LayerExt, Routes};
+use tonic::transport::Server;
 use tonic::transport::server::TcpIncoming;
-use tonic::transport::{Identity, Server, ServerTlsConfig};
 use tonic::{Request, Status};
 
 use crate::api::grpc::artifact_download::reap_firmware_temp_files;
@@ -44,6 +44,9 @@ use crate::api::grpc::node_type_resolver::{
     normalize_node_set, normalize_node_type_selector,
 };
 use crate::api::grpc::scaleupfabricmanager_handlers::normalize_v2_node_set;
+use crate::api::grpc::tls_reload::{
+    ReloadingTls, TLS_RELOAD_INTERVAL, TlsAcceptorSource, TlsIncoming, TlsMaterialPaths,
+};
 use crate::config::ExpectedInventoryCatalog;
 use crate::domain::node::ExpectedInventoryPolicy;
 use crate::domain::rack::EndpointConfig;
@@ -310,13 +313,10 @@ impl SwitchTlsRoots {
     }
 }
 
-/// TLS material that has already been read from disk and parsed, ready to hand
-/// to the tonic server. Produced by [`TlsConfig::resolve`]; the parsed bytes
-/// are held in memory so the actual bind never re-reads the files.
+/// API listener TLS material, validated at startup and reloaded from disk when
+/// the mounted files change. Produced by [`TlsConfig::resolve`].
 pub struct TlsConfig {
-    config: ServerTlsConfig,
-    cert_pem: Vec<u8>,
-    key_pem: Vec<u8>,
+    reloading: Arc<ReloadingTls>,
 }
 
 impl TlsConfig {
@@ -336,8 +336,8 @@ impl TlsConfig {
     /// `Some([`InsecurePermit`])` only after [`assert_insecure_allowed`] succeeds.
     ///
     /// Reading happens here, so call it before any side-effecting startup step:
-    /// a bad path fails fast, and the parsed bytes returned are the exact
-    /// material used to bind, with no later re-read that could race a rotation.
+    /// a bad path or unparsable material fails fast. The listeners then re-read
+    /// the files periodically and serve renewed material without a restart.
     pub fn resolve(
         cert: Option<&str>,
         key: Option<&str>,
@@ -367,51 +367,27 @@ impl TlsConfig {
             );
         }
 
-        let read =
-            |path: &str| std::fs::read(path).map_err(|e| format!("failed to read {path}: {e}"));
-
         // ca is Some: the ca.is_none() guard above returned early.
         let ca = ca.unwrap();
-        let cert_pem = read(cert)?;
-        let key_pem = read(key)?;
-        let identity = Identity::from_pem(&cert_pem, &key_pem);
-        let config = ServerTlsConfig::new()
-            .identity(identity)
-            .client_ca_root(tonic::transport::Certificate::from_pem(read(ca)?));
+        let reloading = ReloadingTls::load(TlsMaterialPaths {
+            cert: PathBuf::from(cert),
+            key: PathBuf::from(key),
+            ca: PathBuf::from(ca),
+        })?;
 
         Ok(Some(Self {
-            config,
-            cert_pem,
-            key_pem,
+            reloading: Arc::new(reloading),
         }))
     }
 
-    /// Build a standard server-authenticated TLS config for the metrics HTTP
-    /// listener. Client certificates are not required.
-    pub fn metrics_rustls_config(&self) -> std::result::Result<Arc<rustls::ServerConfig>, String> {
-        use rustls::pki_types::CertificateDer;
-        use rustls_pemfile::{certs, private_key};
+    /// Server-authenticated acceptors for the metrics HTTP listener. Client
+    /// certificates are not required.
+    pub fn metrics_acceptor_source(&self) -> TlsAcceptorSource {
+        self.reloading.metrics_acceptor_source()
+    }
 
-        let mut cert_reader = self.cert_pem.as_slice();
-        let certs: Vec<CertificateDer<'static>> = certs(&mut cert_reader)
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(|e| format!("failed to parse server certificate PEM: {e}"))?;
-        if certs.is_empty() {
-            return Err("no certificates found in server certificate PEM".into());
-        }
-
-        let mut key_reader = self.key_pem.as_slice();
-        let key = private_key(&mut key_reader)
-            .map_err(|e| format!("failed to parse server key PEM: {e}"))?
-            .ok_or_else(|| "no private key found in server key PEM".to_string())?;
-
-        let mut config = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(certs, key)
-            .map_err(|e| format!("failed to build metrics TLS config: {e}"))?;
-        config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
-
-        Ok(Arc::new(config))
+    pub fn reloader(&self) -> Arc<ReloadingTls> {
+        Arc::clone(&self.reloading)
     }
 }
 
@@ -695,17 +671,20 @@ mod tests {
         assert!(matches!(TlsMode::from_config(&Some(tls)), TlsMode::Mtls));
     }
 
-    /// Creates three placeholder (non-PEM) readable files in a temp directory.
-    /// Content is intentionally invalid PEM; tonic parses lazily at bind time,
-    /// so `TlsConfig::resolve` accepts them.
+    /// Creates a self-signed certificate, its key, and a CA file (the same
+    /// certificate) in a temp directory. `TlsConfig::resolve` parses the
+    /// material eagerly, so the files must hold valid PEM.
     fn temp_readable_files_with_ca() -> (tempfile::TempDir, String, String, String) {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let generated =
+            rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("generate cert");
         let dir = tempfile::tempdir().expect("create temp dir");
         let cert = dir.path().join("cert.pem");
         let key = dir.path().join("key.pem");
         let ca = dir.path().join("ca.pem");
-        std::fs::write(&cert, b"placeholder").expect("write cert");
-        std::fs::write(&key, b"placeholder").expect("write key");
-        std::fs::write(&ca, b"placeholder").expect("write ca");
+        std::fs::write(&cert, generated.cert.pem()).expect("write cert");
+        std::fs::write(&key, generated.key_pair.serialize_pem()).expect("write key");
+        std::fs::write(&ca, generated.cert.pem()).expect("write ca");
         let (c, k, a) = (
             cert.to_str().unwrap().to_string(),
             key.to_str().unwrap().to_string(),
@@ -893,7 +872,7 @@ mod tests {
     }
 
     #[test]
-    fn metrics_rustls_config_builds_server_authenticated_tls() {
+    fn resolve_loads_material_for_both_listeners() {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let generated =
             rcgen::generate_simple_self_signed(vec!["localhost".into()]).expect("generate cert");
@@ -917,8 +896,9 @@ mod tests {
         .unwrap()
         .expect("fixture provides TLS material");
 
-        tls.metrics_rustls_config()
-            .expect("metrics TLS config should build without client auth");
+        let metrics_acceptor = tls.metrics_acceptor_source();
+        let _ = metrics_acceptor();
+        assert!(!tls.reloader().certificate_info().serial.is_empty());
     }
 
     #[tokio::test]
@@ -1247,6 +1227,11 @@ impl GrpcServer {
         self
     }
 
+    /// The reloadable TLS material serving the API, when mTLS is configured.
+    pub fn tls_reloader(&self) -> Option<Arc<ReloadingTls>> {
+        self.tls.as_ref().map(TlsConfig::reloader)
+    }
+
     pub fn with_listener_mode(mut self, mode: ApiListenerMode) -> Self {
         self.listener_mode = mode;
         self
@@ -1304,16 +1289,21 @@ impl GrpcServer {
 
         self.sftp_upload_options.validate()?;
 
-        // Build the server (and apply TLS if configured) before spawning so any
-        // error is reported via this `Result` rather than swallowed inside the
-        // background task. Borrow (don't take) `self.tls` and clone the parsed
-        // config so a repeated `start()` cannot silently fall back to plaintext.
-        let mut builder = Server::builder().accept_http1(true);
-        if let Some(tls) = &self.tls {
-            tracing::info!(port = self.port, mode = "mTLS", "gRPC server starting");
-            builder = builder
-                .tls_config(tls.config.clone())
-                .map_err(|e| RmsError::internal(format!("failed to apply TLS config: {e}")))?;
+        // Decide the listener mode before spawning so any error is reported via
+        // this `Result` rather than swallowed inside the background task. Borrow
+        // (don't take) `self.tls` so a repeated `start()` cannot silently fall
+        // back to plaintext.
+        let builder = Server::builder().accept_http1(true);
+        let tls = self.tls.as_ref().map(TlsConfig::reloader);
+        if let Some(tls) = &tls {
+            let certificate = tls.certificate_info();
+            tracing::info!(
+                port = self.port,
+                mode = "mTLS",
+                certificate_serial = %certificate.serial,
+                certificate_not_after = certificate.not_after,
+                "gRPC server starting"
+            );
         } else if self.listener_mode == ApiListenerMode::Insecure {
             tracing::warn!(
                 port = self.port,
@@ -1394,17 +1384,36 @@ impl GrpcServer {
 
         let router = builder.layer(log_layer).add_routes(Routes::from(routes));
 
-        tokio::spawn(async move {
-            if let Err(e) = router
-                .serve_with_incoming_shutdown(incoming, async {
-                    let mut rx = shutdown_rx;
-                    let _ = rx.changed().await;
-                })
-                .await
-            {
-                tracing::error!(error = %e, "gRPC server error");
+        let shutdown = {
+            let mut rx = shutdown_rx.clone();
+            async move {
+                let _ = rx.changed().await;
             }
-        });
+        };
+        match tls {
+            Some(tls) => {
+                tls.spawn_watcher(TLS_RELOAD_INTERVAL, shutdown_rx.clone());
+                let incoming = TlsIncoming::new(incoming, tls, shutdown_rx);
+                tokio::spawn(async move {
+                    if let Err(e) = router
+                        .serve_with_incoming_shutdown(incoming, shutdown)
+                        .await
+                    {
+                        tracing::error!(error = %e, "gRPC server error");
+                    }
+                });
+            }
+            None => {
+                tokio::spawn(async move {
+                    if let Err(e) = router
+                        .serve_with_incoming_shutdown(incoming, shutdown)
+                        .await
+                    {
+                        tracing::error!(error = %e, "gRPC server error");
+                    }
+                });
+            }
+        }
 
         Ok(())
     }
